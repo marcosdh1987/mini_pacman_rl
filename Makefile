@@ -1,4 +1,4 @@
-.PHONY: setup run test clean
+.PHONY: setup run test test-unit clean
 
 # Crea/actualiza el entorno virtual (.venv) e instala dependencias con uv.
 setup:
@@ -16,7 +16,14 @@ test: setup
 import rl_core; \
 t = rl_core.Trainer('Q-learning', seed=1); t.train(episodes=5); \
 d = rl_core.Trainer('DQN (PyTorch)', seed=1); d.train(episodes=5); \
-print('smoke test ok: Q-learning y DQN entrenaron sin errores')"
+g = rl_core.GHOST_PATTERNS['loop']; \
+rl_core.Trainer('Q-learning', seed=1, ghost=g).train(episodes=5); \
+rl_core.Trainer('DQN (PyTorch)', seed=1, ghost=g).train(episodes=5); \
+print('smoke test ok: Q-learning y DQN entrenaron sin errores (fantasma fijo y movil)')"
+
+# Tests unitarios (pytest se descarga al vuelo, no se agrega como dependencia).
+test-unit: setup
+	uv run --with pytest pytest -q tests
 
 clean:
 	rm -rf .venv __pycache__

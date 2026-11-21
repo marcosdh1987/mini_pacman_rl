@@ -17,6 +17,7 @@ Otros targets disponibles:
 ```bash
 make setup   # solo crea el entorno e instala dependencias, sin levantar la app
 make test    # smoke test: entrena unos pocos episodios de Q-learning y DQN sin UI
+make test-unit  # tests unitarios con pytest (tests/)
 make clean   # borra .venv y cachés de Python
 ```
 
@@ -52,16 +53,26 @@ En Windows, para activar el entorno virtual: `.venv\Scripts\activate`.
 3. Entrená 300-600 episodios adicionales y compará con la política sin entrenar.
 4. Elegí **DQN (PyTorch)**; entrená de a 200 episodios e inspeccioná los pesos `W1`/`W2` a diferentes checkpoints. El aprendizaje de la red puede ser menos estable.
 5. Compará la trayectoria resultante en la misma grilla.
-6. Cambiá **alpha** (Q-learning), **gamma**, el premio de la moneda, el castigo al fantasma o el shaping y reiniciá para repetir. La tasa de aprendizaje DQN es fija en esta primera demo para controlar variables.
+6. Elegí un **patrón de fantasma** móvil, reiniciá y repetí: hacen falta más episodios (más estados), y con el selector de fase podés ver cómo la política cambia según dónde esté el fantasma (esperar, rodearlo, pasar detrás).
+7. Cambiá **alpha** (Q-learning), **gamma**, el premio de la moneda, el castigo al fantasma o el shaping y reiniciá para repetir. La tasa de aprendizaje DQN es fija en esta primera demo para controlar variables.
 
 ## Entorno y recompensas
 
 - Grilla 5×5, movimientos arriba/abajo/izquierda/derecha.
-- Moneda `(4,4)` +10; fantasma `(3,2)` -15, con final del episodio.
+- Moneda `(4,4)` +10; fantasma -15, con final del episodio.
+- Fantasma configurable (barra lateral → *Movimiento del fantasma*):
+  - **Estático**: quieto en `(3,2)` (comportamiento original).
+  - **Patrulla vertical**: sube y baja por la columna derecha `(1,4)→(2,4)→(3,4)→(2,4)`.
+  - **Patrulla horizontal**: va y viene por la fila 3 `(3,0)→(3,1)→(3,2)→(3,1)`, que todo camino a la moneda debe cruzar.
+  - **Ronda circular**: gira por el centro `(1,2)→(1,3)→(1,4)→(2,4)→(2,3)→(2,2)`.
+  - **Personalizado**: escribís la ruta, p. ej. `2,2 2,3 2,4 3,4 2,4 2,3` (casillas vecinas, cíclica, máx. 12).
+- El fantasma avanza una casilla de su ruta por cada paso del agente y repite el ciclo. El agente ve
+  `(su casilla, fase del fantasma)`, por eso el patrón es **aprendible**: hay `25 × largo del ciclo` estados.
+  Ver `docs/ghost-movement.md`.
 - Cada paso -0.05; chocar con un muro/borde -0.55 extra.
 - Acercarse a la moneda +0.10; alejarse -0.10 (reward shaping).
 - Máximo 30 pasos por episodio.
-- Los episodios de entrenamiento comienzan en posiciones aleatorias válidas; la partida visual inicia en `(0,0)`.
+- Los episodios de entrenamiento comienzan en posiciones (y fases del fantasma) aleatorias válidas; la partida visual y la evaluación arrancan con el fantasma en la fase `f0`.
 
 ## Qué significan los gráficos
 

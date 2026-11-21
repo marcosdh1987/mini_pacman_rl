@@ -15,13 +15,15 @@ from torch import nn
 torch.set_num_threads(1)
 
 SIZE = 5
+N_CELLS = SIZE * SIZE
 START = (0, 0)
 GOAL = (4, 4)
 WALLS = {(1, 1), (2, 1), (3, 3)}
-GHOST = (3, 2)
+GHOST = (3, 2)  # position of the static ghost (the original, default pattern)
 MOVES = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 ARROWS = ["↑", "↓", "←", "→"]
 HORIZON = 30
+MAX_ROUTE_LENGTH = 12
 DEFAULT_REWARDS = {"goal": 10.0, "ghost": -15.0, "step": -0.05, "wall": -0.55, "progress": 0.10}
 
 
@@ -33,21 +35,133 @@ def from_id(i):
     return (int(i) // SIZE, int(i) % SIZE)
 
 
-VALID_STARTS = tuple((r, c) for r in range(SIZE) for c in range(SIZE)
-                     if (r, c) not in WALLS and (r, c) not in (GOAL, GHOST))
+@dataclass(frozen=True)
+class GhostPattern:
+    """A fixed, cyclic ghost route.
+
+    The ghost occupies ``route[phase]`` and advances one entry per environment
+    step, wrapping around after the last cell. Because the route is fixed and
+    the phase is part of the agent's observation, the movement is fully
+    predictable and therefore learnable.
+    """
+
+    route: tuple[tuple[int, int], ...]
+
+    def __post_init__(self):
+        validate_route(self.route)
+
+    @property
+    def period(self) -> int:
+        return len(self.route)
+
+    @property
+    def is_static(self) -> bool:
+        return self.period == 1
+
+    def position(self, phase: int) -> tuple[int, int]:
+        return self.route[int(phase) % self.period]
+
+
+def validate_route(route) -> None:
+    """Raise ``ValueError`` if ``route`` is not a valid cyclic ghost route."""
+    if not route:
+        raise ValueError("The route needs at least one cell.")
+    if len(route) > MAX_ROUTE_LENGTH:
+        raise ValueError(f"The route can have at most {MAX_ROUTE_LENGTH} cells.")
+    for cell in route:
+        r, c = cell
+        if not (0 <= r < SIZE and 0 <= c < SIZE):
+            raise ValueError(f"Cell {cell} is outside the {SIZE}x{SIZE} grid.")
+        if cell in WALLS:
+            raise ValueError(f"Cell {cell} is a wall.")
+        if cell in (GOAL, START):
+            raise ValueError(f"Cell {cell} is reserved (coin or start).")
+    for i, a in enumerate(route):
+        b = route[(i + 1) % len(route)]
+        if abs(a[0] - b[0]) + abs(a[1] - b[1]) > 1:
+            raise ValueError(f"{a} -> {b}: consecutive cells must be adjacent "
+                             "(the route is cyclic, the last cell connects to the first).")
+
+
+def parse_route(text: str) -> GhostPattern:
+    """Parse ``"r,c r,c ..."`` (spaces, ``;`` or ``|`` separate cells)."""
+    cells = []
+    for token in text.replace(";", " ").replace("|", " ").split():
+        parts = token.strip("()").split(",")
+        if len(parts) != 2:
+            raise ValueError(f"Could not read cell '{token}': use the 'row,column' format.")
+        try:
+            cells.append((int(parts[0]), int(parts[1])))
+        except ValueError as exc:
+            raise ValueError(f"Could not read cell '{token}': use integers.") from exc
+    return GhostPattern(tuple(cells))
+
+
+GHOST_PATTERNS = {
+    # The original behaviour: the ghost never moves.
+    "static": GhostPattern((GHOST,)),
+    # Up and down the right-hand column, guarding the route along the edge.
+    "vertical_patrol": GhostPattern(((1, 4), (2, 4), (3, 4), (2, 4))),
+    # Back and forth along row 3, which every path to the coin must cross.
+    "horizontal_patrol": GhostPattern(((3, 0), (3, 1), (3, 2), (3, 1))),
+    # A clockwise loop through the middle of the board.
+    "loop": GhostPattern(((1, 2), (1, 3), (1, 4), (2, 4), (2, 3), (2, 2))),
+}
+DEFAULT_PATTERN = GHOST_PATTERNS["static"]
+
+
+def encode_state(pos, phase=0):
+    """Agent state = (agent cell, ghost phase) flattened to one integer."""
+    return int(phase) * N_CELLS + to_id(pos)
+
+
+def decode_state(state):
+    """Inverse of :func:`encode_state`: returns ``(cell, phase)``."""
+    return from_id(int(state) % N_CELLS), int(state) // N_CELLS
+
+
+def n_inputs(ghost: GhostPattern) -> int:
+    """DQN input size: one-hot agent cell, plus one-hot ghost phase if it moves."""
+    return N_CELLS if ghost.is_static else N_CELLS + ghost.period
+
+
+def free_cells(ghost: GhostPattern = DEFAULT_PATTERN, phase: int = 0):
+    """Cells where an episode may start: not a wall, the coin, the ghost, nor
+    the cell the ghost moves into on the first step (an unavoidable hit)."""
+    blocked = WALLS | {GOAL, ghost.position(phase), ghost.position(phase + 1)}
+    return tuple((r, c) for r in range(SIZE) for c in range(SIZE) if (r, c) not in blocked)
+
+
+VALID_STARTS = free_cells()
 
 
 class Maze:
-    def __init__(self, seed=42, rewards=None):
+    def __init__(self, seed=42, rewards=None, ghost: GhostPattern | None = None):
         self.rewards = dict(DEFAULT_REWARDS if rewards is None else rewards)
+        self.ghost = DEFAULT_PATTERN if ghost is None else ghost
         self.rng = random.Random(seed)
         self.pos = START
+        self.phase = 0
         self.steps = 0
 
-    def reset(self, random_start=False):
-        self.pos = self.rng.choice(VALID_STARTS) if random_start else START
+    @property
+    def ghost_pos(self):
+        return self.ghost.position(self.phase)
+
+    def state(self):
+        return encode_state(self.pos, self.phase)
+
+    def reset(self, random_start=False, phase=0):
+        """Random starts also randomise the ghost phase (only if it moves, so
+        the static environment consumes the RNG exactly as before)."""
+        if random_start:
+            self.phase = self.rng.randrange(self.ghost.period) if not self.ghost.is_static else 0
+            self.pos = self.rng.choice(free_cells(self.ghost, self.phase))
+        else:
+            self.phase = int(phase) % self.ghost.period
+            self.pos = START
         self.steps = 0
-        return to_id(self.pos)
+        return self.state()
 
     def step(self, action):
         old = self.pos
@@ -64,38 +178,52 @@ class Maze:
             next_dist = abs(nxt[0] - GOAL[0]) + abs(nxt[1] - GOAL[1])
             reward += self.rewards["progress"] * (previous_dist - next_dist)
         self.pos = nxt
-        success = nxt == GOAL
-        collision = nxt == GHOST
+        # The agent moves first, then the ghost advances one cell on its route.
+        # Touching the ghost before or after its move is a collision, so the
+        # agent cannot "swap places" through it.
+        ghost_before = self.ghost_pos
+        self.phase = (self.phase + 1) % self.ghost.period
+        collision = nxt in (ghost_before, self.ghost_pos)
+        success = nxt == GOAL and not collision
         if success:
             reward += self.rewards["goal"]
         if collision:
             reward += self.rewards["ghost"]
         done = bool(success or collision or self.steps >= HORIZON)
-        return to_id(nxt), float(reward), done, {"success": success, "ghost": collision}
+        return self.state(), float(reward), done, {"success": success, "ghost": collision,
+                                                   "ghost_pos": self.ghost_pos}
 
 
 class SmallDQN(nn.Module):
-    def __init__(self):
+    def __init__(self, inputs=N_CELLS):
         super().__init__()
-        self.fc1 = nn.Linear(SIZE * SIZE, 32)
+        self.fc1 = nn.Linear(inputs, 32)
         self.fc2 = nn.Linear(32, 4)
 
     def forward(self, x):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def onehot(ids):
+def features(ids, ghost: GhostPattern = DEFAULT_PATTERN):
+    """DQN input: one-hot of the agent cell (+ one-hot of the ghost phase)."""
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
-    x = np.zeros((len(ids), SIZE * SIZE), dtype=np.float32)
-    x[np.arange(len(ids)), ids] = 1.0
-    return torch.from_numpy(x)
+    x = np.zeros((len(ids), n_inputs(ghost)), dtype=np.float32)
+    rows = np.arange(len(ids))
+    x[rows, ids % N_CELLS] = 1.0
+    if not ghost.is_static:
+        x[rows, N_CELLS + ids // N_CELLS] = 1.0
+    return x
+
+
+def onehot(ids, ghost: GhostPattern = DEFAULT_PATTERN):
+    return torch.from_numpy(features(ids, ghost))
 
 
 def snapshot(trainer):
     if trainer.mode == "Q-learning":
         return {"episode": trainer.episode, "q": trainer.q.copy(),
-                "visits": trainer.visits.copy()}
-    return {"episode": trainer.episode,
+                "visits": trainer.visits.copy(), "ghost": trainer.ghost}
+    return {"episode": trainer.episode, "ghost": trainer.ghost,
             "w1": trainer.network.fc1.weight.detach().numpy().copy(),
             "b1": trainer.network.fc1.bias.detach().numpy().copy(),
             "w2": trainer.network.fc2.weight.detach().numpy().copy(),
@@ -110,7 +238,9 @@ def forward_details(snap, state):
     contribution matrix ``contrib[a, j] = W2[a, j] * h[j]`` so that
     ``Q(s, a) = sum_j contrib[a, j] + b2[a]``.
     """
-    pre = snap["w1"][:, state] + snap["b1"]  # one-hot input selects a column of W1
+    # The input is one-hot, so the layer just selects columns of W1: the agent
+    # cell column, plus the ghost-phase column when the ghost moves.
+    pre = snap["w1"] @ features([state], snap["ghost"])[0] + snap["b1"]
     hidden = np.maximum(0, pre)
     contrib = snap["w2"] * hidden[None, :]
     return {"pre": pre, "hidden": hidden, "contrib": contrib,
@@ -120,8 +250,7 @@ def forward_details(snap, state):
 def snapshot_values(snap, state):
     if "q" in snap:
         return snap["q"][state]
-    x = np.zeros(SIZE * SIZE, dtype=np.float32)
-    x[state] = 1.0
+    x = features([state], snap["ghost"])[0]
     hidden = np.maximum(0, snap["w1"] @ x + snap["b1"])
     return snap["w2"] @ hidden + snap["b2"]
 
@@ -138,22 +267,24 @@ class EpisodeResult:
 
 
 class Trainer:
-    def __init__(self, mode="Q-learning", seed=42, rewards=None):
+    def __init__(self, mode="Q-learning", seed=42, rewards=None, ghost: GhostPattern | None = None):
         self.rewards = dict(DEFAULT_REWARDS if rewards is None else rewards)
+        self.ghost = DEFAULT_PATTERN if ghost is None else ghost
         self.mode = mode
         self.seed = seed
         self.episode = 0
         self.rng = random.Random(seed)
-        self.environment = Maze(seed, self.rewards)
-        self.q = np.zeros((SIZE * SIZE, 4), dtype=np.float32)
+        self.environment = Maze(seed, self.rewards, self.ghost)
+        self.n_states = N_CELLS * self.ghost.period
+        self.q = np.zeros((self.n_states, 4), dtype=np.float32)
         torch.manual_seed(seed)
-        self.network = SmallDQN()
-        self.target = SmallDQN()
+        self.network = SmallDQN(n_inputs(self.ghost))
+        self.target = SmallDQN(n_inputs(self.ghost))
         self.target.load_state_dict(self.network.state_dict())
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=0.002)
         self.memory = deque(maxlen=5000)
         self.steps = 0
-        self.visits = np.zeros(SIZE * SIZE, dtype=np.int64)
+        self.visits = np.zeros(self.n_states, dtype=np.int64)
         self.history = []
         self.checkpoint_every = 25
         self.live = None  # episode in progress (used by step-by-step mode)
@@ -166,7 +297,7 @@ class Trainer:
         if self.mode == "Q-learning":
             return self.q[state].copy()
         with torch.no_grad():
-            return self.network(onehot([state]))[0].numpy().copy()
+            return self.network(onehot([state], self.ghost))[0].numpy().copy()
 
     def act(self, state, eps):
         return self.act_explained(state, eps)[0]
@@ -192,10 +323,10 @@ class Trainer:
             return None
         batch = self.rng.sample(self.memory, 64)
         states, actions, rewards, next_states, dones = zip(*batch)
-        values = self.network(onehot(states)).gather(
+        values = self.network(onehot(states, self.ghost)).gather(
             1, torch.tensor(actions, dtype=torch.long).view(-1, 1)).squeeze(1)
         with torch.no_grad():
-            target_q = self.target(onehot(next_states)).max(dim=1).values
+            target_q = self.target(onehot(next_states, self.ghost)).max(dim=1).values
             expected = torch.tensor(rewards, dtype=torch.float32) + \
                 gamma * (1 - torch.tensor(dones, dtype=torch.float32)) * target_q
         loss = nn.functional.smooth_l1_loss(values, expected)
@@ -269,7 +400,7 @@ class Trainer:
         else:
             if detail:
                 with torch.no_grad():
-                    next_max = 0.0 if done else float(self.target(onehot([sp])).max().item())
+                    next_max = 0.0 if done else float(self.target(onehot([sp], self.ghost)).max().item())
                 trace.update(old=float(values_before[a]), next_max=next_max,
                              target=reward + gamma * next_max, gamma=gamma)
             self.memory.append((s, a, reward, sp, float(done)))
@@ -306,15 +437,19 @@ class Trainer:
             self.checkpoints.append(snapshot(self))
 
 
-def evaluate_snapshot(snap, starts=VALID_STARTS):
+def evaluate_snapshot(snap, starts=None):
+    """Greedy rollout from every valid start, with the ghost at phase 0."""
+    ghost = snap["ghost"]
+    starts = free_cells(ghost, 0) if starts is None else starts
     wins = 0
     travel = []
     ghosts = 0
     for initial in starts:
-        e = Maze()
+        e = Maze(ghost=ghost)
+        e.reset(phase=0)
         e.pos = initial
         for _ in range(HORIZON):
-            sp, reward, done, info = e.step(choose_snapshot_action(snap, to_id(e.pos)))
+            sp, reward, done, info = e.step(choose_snapshot_action(snap, e.state()))
             if done:
                 wins += int(info["success"])
                 ghosts += int(info["ghost"])
@@ -326,10 +461,10 @@ def evaluate_snapshot(snap, starts=VALID_STARTS):
             "mean_steps": float(np.mean(travel)) if travel else None}
 
 
-def evaluate_random(seed=123, rounds=300):
+def evaluate_random(seed=123, rounds=300, ghost: GhostPattern | None = None):
     wins = 0
     rng = random.Random(seed)
-    e = Maze(seed)
+    e = Maze(seed, ghost=ghost)
     for _ in range(rounds):
         e.reset(random_start=True)
         for _ in range(HORIZON):

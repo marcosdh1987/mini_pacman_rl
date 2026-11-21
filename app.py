@@ -11,9 +11,9 @@ import pandas as pd
 import streamlit as st
 
 from rl_core import (
-    ARROWS, GOAL, GHOST, HORIZON, SIZE, START, WALLS,
-    DEFAULT_REWARDS, Maze, Trainer, choose_snapshot_action, evaluate_random,
-    evaluate_snapshot, forward_details, from_id, snapshot, snapshot_values, to_id,
+    ARROWS, GHOST_PATTERNS, GOAL, HORIZON, N_CELLS, SIZE, START, WALLS,
+    Maze, Trainer, choose_snapshot_action, decode_state, encode_state, evaluate_random,
+    evaluate_snapshot, forward_details, parse_route, snapshot, snapshot_values, to_id,
 )
 from matplotlib import colormaps
 from matplotlib.colors import TwoSlopeNorm
@@ -31,10 +31,13 @@ def _value_color(v, vmax):
     return f"rgb({r},{g},{b})", ("#10202e" if lum > 150 else "white")
 
 
-def render_board(position=START, path=None, policy=None, values=None, focus=None, size=48, show_numbers=True):
+def render_board(position=START, path=None, policy=None, values=None, focus=None, size=48, show_numbers=True,
+                 ghost=None, route=()):
     """HTML grid. ``values`` (dict pos->float) colours free cells by value and
-    prints the number; ``focus`` outlines one cell (the state being updated)."""
+    prints the number; ``focus`` outlines one cell (the state being updated).
+    ``ghost`` is the current ghost cell; ``route`` cells get a dashed outline."""
     path = path or []
+    route = set(route)
     vmax = max([abs(v) for v in values.values()] + [1e-6]) if values else 1.0
     cells = []
     for r in range(SIZE):
@@ -45,7 +48,7 @@ def render_board(position=START, path=None, policy=None, values=None, focus=None
                 symbol, bg, fg = "🟡", "#205975", "white"
             elif pos == GOAL:
                 symbol, bg, fg = "🟨", "#e5b72b", "#172330"
-            elif pos == GHOST:
+            elif pos == ghost:
                 symbol, bg, fg = "👻", "#9d3a4d", "white"
             elif pos in WALLS:
                 symbol, bg, fg = "", "#536172", "white"
@@ -56,7 +59,12 @@ def render_board(position=START, path=None, policy=None, values=None, focus=None
                 if values is not None and pos in values:
                     bg, fg = _value_color(values[pos], vmax)
                     sub = f"{values[pos]:+.1f}" if show_numbers else ""
-            border = "outline:3px solid #ffd84d;outline-offset:-3px;" if pos == focus else ""
+            if pos == focus:
+                border = "outline:3px solid #ffd84d;outline-offset:-3px;"
+            elif pos in route and pos != ghost:
+                border = "outline:2px dashed #c75b70;outline-offset:-3px;"
+            else:
+                border = ""
             label = (f'<div style="line-height:1">{html.escape(symbol)}'
                      + (f'<div style="font-size:10px;font-weight:500">{sub}</div>' if sub else "")
                      + "</div>")
@@ -70,19 +78,38 @@ def render_board(position=START, path=None, policy=None, values=None, focus=None
             + ''.join(cells) + '</div>')
 
 
-def policy_map(snap):
-    return {(r, c): ARROWS[choose_snapshot_action(snap, to_id((r, c)))]
+def policy_map(snap, phase=0):
+    """Preferred action per cell, given the ghost is at ``phase`` of its route."""
+    return {(r, c): ARROWS[choose_snapshot_action(snap, encode_state((r, c), phase))]
             for r in range(SIZE) for c in range(SIZE) if (r, c) not in WALLS}
 
 
-def value_map(snap):
+def value_map(snap, phase=0):
     """V(s) = max_a Q(s, a): how good the agent believes each cell is."""
-    return {(r, c): float(np.max(snapshot_values(snap, to_id((r, c)))))
-            for r in range(SIZE) for c in range(SIZE)
-            if (r, c) not in WALLS and (r, c) not in (GOAL, GHOST)}
+    blocked = WALLS | {GOAL, snap["ghost"].position(phase)}
+    return {(r, c): float(np.max(snapshot_values(snap, encode_state((r, c), phase))))
+            for r in range(SIZE) for c in range(SIZE) if (r, c) not in blocked}
 
 
 STATE_LABELS = [f"({r},{c})" for r in range(SIZE) for c in range(SIZE)]
+
+
+def input_labels(ghost):
+    """Column labels of W1: agent cells, then ghost phases (if it moves)."""
+    return STATE_LABELS + ([] if ghost.is_static else [f"f{k}" for k in range(ghost.period)])
+
+
+def state_label(state, ghost):
+    cell, phase = decode_state(state)
+    return f"{cell}" if ghost.is_static else f"{cell}·f{phase}"
+
+
+def phase_picker(ghost, key, label="Fase del fantasma"):
+    """Phase selector shown only when the ghost moves (its position is part of the state)."""
+    if ghost.is_static:
+        return 0
+    return st.select_slider(label, options=list(range(ghost.period)), key=f"{key}_{ghost.route}",
+                            format_func=lambda k: f"f{k} · 👻 en {ghost.position(k)}")
 
 
 def heatmap(a, title, xlabels=None, ylabels=None, xlabel=None, ylabel=None, figsize=(7.2, 3.6)):
@@ -123,8 +150,17 @@ def q_bars(before, after=None, chosen=None):
 
 
 def make_play():
-    return {"pos": START, "path": [START], "steps": 0, "reward": 0.0,
+    return {"pos": START, "phase": 0, "path": [START], "steps": 0, "reward": 0.0,
             "done": False, "status": "En curso", "last_action": "—", "last_values": None}
+
+
+PATTERN_LABELS = {
+    "static": "Estático (no se mueve)",
+    "vertical_patrol": "Patrulla vertical (columna derecha)",
+    "horizontal_patrol": "Patrulla horizontal (fila 3)",
+    "loop": "Ronda circular (centro)",
+    "custom": "Personalizado…",
+}
 
 
 # Distinct learners retain state while switching methods.
@@ -149,17 +185,43 @@ with st.sidebar:
     progress_reward = st.slider("Premio por acercarse", 0.0, 0.5, 0.10, 0.05)
     configured_rewards = {"goal": float(goal_reward), "ghost": float(ghost_penalty),
                           "step": -0.05, "wall": -0.55, "progress": float(progress_reward)}
+    st.markdown("**Movimiento del fantasma**")
+    pattern_key = st.selectbox("Patrón", list(PATTERN_LABELS), format_func=PATTERN_LABELS.get,
+                               help="El fantasma recorre una ruta fija y cíclica, una casilla por paso. "
+                                    "Como el patrón es siempre el mismo, el agente puede aprenderlo.")
+    if pattern_key == "custom":
+        route_text = st.text_input("Ruta (fila,columna separadas por espacio)", "2,2 2,3 2,4 3,4 2,4 2,3",
+                                   help="Casillas consecutivas deben ser vecinas y la última conecta con la "
+                                        "primera. Sin muros, sin la moneda (4,4) ni la salida (0,0). Máx. 12.")
+        try:
+            configured_ghost = parse_route(route_text)
+        except ValueError as exc:
+            st.error(f"Ruta inválida: {exc}")
+            configured_ghost = GHOST_PATTERNS["static"]
+    else:
+        configured_ghost = GHOST_PATTERNS[pattern_key]
+    st.markdown(render_board(position=(-1, -1), ghost=configured_ghost.position(0),
+                             route=configured_ghost.route, size=26), unsafe_allow_html=True)
+    if configured_ghost.is_static:
+        st.caption("El fantasma queda quieto: el estado es solo la casilla del agente (25 estados).")
+    else:
+        st.caption(f"Ciclo de {configured_ghost.period} pasos: "
+                   + " → ".join(str(c) for c in configured_ghost.route) + " → … "
+                   f"El estado pasa a ser (casilla, fase del fantasma): {N_CELLS}×{configured_ghost.period} = "
+                   f"{N_CELLS * configured_ghost.period} estados.")
     if st.button("🔁 Reiniciar entrenamiento", width="stretch"):
-        st.session_state.trainers[mode] = Trainer(mode, int(seed), configured_rewards)
+        st.session_state.trainers[mode] = Trainer(mode, int(seed), configured_rewards, configured_ghost)
         st.session_state.play_key = None
         st.session_state.pop(f"trace_{mode}", None)
         st.rerun()
 
 if mode not in st.session_state.trainers:
-    st.session_state.trainers[mode] = Trainer(mode, int(seed), configured_rewards)
+    st.session_state.trainers[mode] = Trainer(mode, int(seed), configured_rewards, configured_ghost)
 trainer = st.session_state.trainers[mode]
-if configured_rewards != trainer.rewards or int(seed) != trainer.seed:
-    st.warning("Cambiaste la semilla o las recompensas. Pulsá «Reiniciar entrenamiento» para aplicarlas limpiamente.")
+ghost = trainer.ghost
+if configured_rewards != trainer.rewards or int(seed) != trainer.seed or configured_ghost != ghost:
+    st.warning("Cambiaste la semilla, las recompensas o el patrón del fantasma. "
+               "Pulsá «Reiniciar entrenamiento» para aplicarlos limpiamente.")
 
 col_train, col_info = st.columns([1, 2])
 with col_train:
@@ -175,14 +237,16 @@ with col_info:
     st.subheader("Resultados evaluados sin exploración")
     initial = evaluate_snapshot(trainer.checkpoints[0])
     current = evaluate_snapshot(trainer.checkpoints[-1])
-    rand = evaluate_random()
+    rand = evaluate_random(ghost=ghost)
     m1, m2, m3 = st.columns(3)
     m1.metric("Aleatorio", f"{rand:.0%}", help="300 partidas, inicios al azar")
     m2.metric("Sin entrenar", f"{initial['success_rate']:.0%}", help="Política del episodio 0")
     m3.metric("Entrenado", f"{current['success_rate']:.0%}",
               delta=f"{(current['success_rate'] - initial['success_rate'])*100:+.0f} pp",
               help=f"{current['wins']} de {current['attempts']} posiciones iniciales válidas")
-    st.caption("Éxito al alcanzar la moneda en ≤30 pasos desde 20 posiciones iniciales. El entorno es fijo; los porcentajes son didácticos, no significancia estadística.")
+    st.caption(f"Éxito al alcanzar la moneda en ≤30 pasos desde {current['attempts']} posiciones iniciales"
+               + ("" if ghost.is_static else ", con el fantasma arrancando en la fase f0 de su ruta")
+               + ". El entorno es determinista; los porcentajes son didácticos, no significancia estadística.")
 
 # ---------------------------------------------------------------------------
 st.divider()
@@ -212,12 +276,15 @@ if tr is None:
     st.info("Pulsá «Dar 1 paso de aprendizaje» para ver la primera actualización. "
             "Tip: probalo con el agente sin entrenar y después de 200-300 episodios.")
 else:
-    s, a, sp = from_id(tr["state"]), tr["action"], from_id(tr["next_state"])
+    (s, s_phase), a, (sp, sp_phase) = decode_state(tr["state"]), tr["action"], decode_state(tr["next_state"])
     tcol, ecol = st.columns([1, 2])
     with tcol:
-        st.markdown(render_board(position=sp, path=[from_id(x) for x in tr["path"]], focus=s),
+        st.markdown(render_board(position=sp, path=[decode_state(x)[0] for x in tr["path"]], focus=s,
+                                 ghost=ghost.position(sp_phase), route=ghost.route),
                     unsafe_allow_html=True)
-        st.caption("Recuadro amarillo: casilla cuyo valor se actualiza. Verde: recorrido de este episodio.")
+        st.caption("Recuadro amarillo: casilla cuyo valor se actualiza. Verde: recorrido de este episodio."
+                   + ("" if ghost.is_static else f" El fantasma pasó de {ghost.position(s_phase)} (f{s_phase}) "
+                      f"a {ghost.position(sp_phase)} (f{sp_phase}); punteado: su ruta."))
     with ecol:
         kind = ("🎲 **exploró** (movimiento al azar)" if tr["explored"]
                 else "🧠 **explotó** (eligió la acción de mayor Q)")
@@ -262,12 +329,12 @@ else:
         st.markdown("**¿Qué pesos se movieron en este paso de gradiente?**")
         d1, d2 = st.columns(2)
         with d1:
-            show_fig(heatmap(upd["delta_w1"], "ΔW1 en este paso (32 neuronas × 25 casillas)",
-                             xlabels=STATE_LABELS, ylabel="Neurona oculta", xlabel="Casilla de entrada"))
+            show_fig(heatmap(upd["delta_w1"], f"ΔW1 en este paso (32 neuronas × {len(input_labels(ghost))} entradas)",
+                             xlabels=input_labels(ghost), ylabel="Neurona oculta", xlabel="Entrada (casilla / fase)"))
         with d2:
             show_fig(heatmap(upd["delta_w2"], "ΔW2 en este paso (4 acciones × 32 neuronas)",
                              ylabels=ARROWS, xlabel="Neurona oculta"))
-        batch_cells = ", ".join(STATE_LABELS[i] for i in upd["batch_states"])
+        batch_cells = ", ".join(sorted({STATE_LABELS[i % N_CELLS] for i in upd["batch_states"]}))
         st.caption("Como la entrada es one-hot, el gradiente de W1 solo existe en las **columnas de las casillas "
                    f"presentes en el lote** ({batch_cells}) y, en W2, solo en las neuronas activas (ReLU > 0). "
                    "Los cambios tenues en otras columnas vienen del *momentum* de Adam (arrastra la dirección de "
@@ -320,28 +387,37 @@ selected_ep = st.select_slider("Episodio guardado", options=choices, value=choic
 sel_index = choices.index(selected_ep)
 selected = checkpoints[sel_index]
 previous = checkpoints[sel_index - 1] if sel_index > 0 else None
+view_phase = phase_picker(ghost, "view_phase")
+if not ghost.is_static:
+    st.caption("Con el fantasma en movimiento, la política depende de **dónde está el fantasma**: "
+               "movés este control para ver qué haría el agente en cada momento del ciclo.")
+ghost_now = ghost.position(view_phase)
+phase_slice = slice(view_phase * N_CELLS, (view_phase + 1) * N_CELLS)
 
 mapcol, valcol, visitcol = st.columns(3)
 with mapcol:
     st.markdown("**Política: acción preferida**")
-    st.markdown(render_board(position=(-1, -1), policy=policy_map(selected)), unsafe_allow_html=True)
+    st.markdown(render_board(position=(-1, -1), policy=policy_map(selected, view_phase),
+                             ghost=ghost_now, route=ghost.route), unsafe_allow_html=True)
     performance = evaluate_snapshot(selected)
     st.caption(f"Checkpoint {selected_ep} · {performance['wins']}/{performance['attempts']} inicios exitosos")
 with valcol:
     st.markdown("**Valor de cada casilla V(s) = max Q(s, a)**")
-    st.markdown(render_board(position=(-1, -1), policy=policy_map(selected), values=value_map(selected)),
+    st.markdown(render_board(position=(-1, -1), policy=policy_map(selected, view_phase),
+                             values=value_map(selected, view_phase), ghost=ghost_now, route=ghost.route),
                 unsafe_allow_html=True)
     st.caption("Azul = el agente espera ganar desde ahí; rojo = espera perder. Moviendo el slider "
                "se ve cómo el valor de la moneda **se propaga hacia atrás** casilla por casilla.")
 with visitcol:
     st.markdown("**Visitas durante el entrenamiento**")
-    visits = selected["visits"]
+    visits = selected["visits"][phase_slice]
     vis = {(r, c): float(visits[to_id((r, c))]) for r in range(SIZE) for c in range(SIZE)
-           if (r, c) not in WALLS and (r, c) not in (GOAL, GHOST)}
+           if (r, c) not in WALLS and (r, c) not in (GOAL, ghost_now)}
     vmax_vis = max(vis.values()) or 1.0
     st.markdown(render_board(position=(-1, -1),
                              policy={p: f"{int(v)}" for p, v in vis.items()},
-                             values={p: v / vmax_vis for p, v in vis.items()}, show_numbers=False),
+                             values={p: v / vmax_vis for p, v in vis.items()}, show_numbers=False,
+                             ghost=ghost_now, route=ghost.route),
                 unsafe_allow_html=True)
     st.caption("Cuántas veces salió el agente desde cada casilla. Donde casi no pasó, sus valores "
                "están poco entrenados (y las flechas pueden ser poco fiables).")
@@ -349,16 +425,19 @@ with visitcol:
 if mode == "Q-learning":
     tab_now, tab_delta = st.tabs(["Tabla Q del checkpoint", "Qué cambió desde el checkpoint anterior"])
     with tab_now:
-        show_fig(heatmap(selected["q"].T, "Valores Q(s, acción)", xlabels=STATE_LABELS, ylabels=ARROWS,
-                         xlabel="Casilla (estado)", figsize=(10, 2.6)))
-        st.caption("25 estados × 4 movimientos. Cada celda es un número independiente: no hay red neuronal. "
+        phase_note = "" if ghost.is_static else f" · fantasma en fase f{view_phase}"
+        show_fig(heatmap(selected["q"][phase_slice].T, "Valores Q(s, acción)" + phase_note,
+                         xlabels=STATE_LABELS, ylabels=ARROWS, xlabel="Casilla (estado)", figsize=(10, 2.6)))
+        st.caption(f"{trainer.n_states} estados × 4 movimientos"
+                   + ("" if ghost.is_static else f" (se muestran los 25 de la fase f{view_phase})")
+                   + ". Cada celda es un número independiente: no hay red neuronal. "
                    "Blanco = 0 (todavía sin aprender), azul = positivo, rojo = negativo.")
     with tab_delta:
         if previous is None:
             st.info("El episodio 0 es el punto de partida: todos los valores Q valen 0.")
         else:
-            show_fig(heatmap(selected["q"].T - previous["q"].T,
-                             f"ΔQ entre episodio {previous['episode']} y {selected_ep}",
+            show_fig(heatmap((selected["q"][phase_slice] - previous["q"][phase_slice]).T,
+                             f"ΔQ entre episodio {previous['episode']} y {selected_ep}" + phase_note,
                              xlabels=STATE_LABELS, ylabels=ARROWS, xlabel="Casilla (estado)", figsize=(10, 2.6)))
             st.caption("Solo cambian las celdas (estado, acción) que el agente probó en esos episodios.")
 else:
@@ -367,8 +446,8 @@ else:
     with tab_now:
         a1, b1 = st.columns(2)
         with a1:
-            show_fig(heatmap(selected["w1"], "W1: 32 neuronas × 25 casillas",
-                             xlabels=STATE_LABELS, ylabel="Neurona oculta", xlabel="Casilla de entrada"))
+            show_fig(heatmap(selected["w1"], f"W1: 32 neuronas × {len(input_labels(ghost))} entradas",
+                             xlabels=input_labels(ghost), ylabel="Neurona oculta", xlabel="Entrada (casilla / fase)"))
         with b1:
             show_fig(heatmap(selected["w2"], "W2: 4 acciones × 32 neuronas", ylabels=ARROWS,
                              xlabel="Neurona oculta"))
@@ -376,7 +455,9 @@ else:
         diff1 = np.mean(np.abs(selected["w1"] - init["w1"]))
         diff2 = np.mean(np.abs(selected["w2"] - init["w2"]))
         st.caption(f"Cambio promedio absoluto desde episodio 0: W1 = {diff1:.4f}, W2 = {diff2:.4f}. "
-                   "Columna j de W1 = cómo «ve» la red la casilla j. Fila a de W2 = qué neuronas empujan la acción a.")
+                   "Columna j de W1 = cómo «ve» la red la casilla j. Fila a de W2 = qué neuronas empujan la acción a."
+                   + ("" if ghost.is_static else " Las columnas f0, f1… codifican la fase del fantasma: "
+                      "así la red sabe dónde está y puede anticipar su movimiento."))
     with tab_delta:
         if previous is None:
             st.info("El episodio 0 tiene pesos aleatorios iniciales. Elegí un checkpoint posterior.")
@@ -385,7 +466,8 @@ else:
             with a2:
                 show_fig(heatmap(selected["w1"] - previous["w1"],
                                  f"ΔW1 (episodio {previous['episode']} → {selected_ep})",
-                                 xlabels=STATE_LABELS, ylabel="Neurona oculta", xlabel="Casilla de entrada"))
+                                 xlabels=input_labels(ghost), ylabel="Neurona oculta",
+                                 xlabel="Entrada (casilla / fase)"))
             with b2:
                 show_fig(heatmap(selected["w2"] - previous["w2"],
                                  f"ΔW2 (episodio {previous['episode']} → {selected_ep})",
@@ -393,15 +475,18 @@ else:
             col_change = np.abs(selected["w1"] - previous["w1"]).sum(axis=0)
             top = np.argsort(col_change)[::-1][:3]
             st.caption("Casillas cuyos pesos de entrada más cambiaron: "
-                       + ", ".join(STATE_LABELS[i] for i in top)
+                       + ", ".join(input_labels(ghost)[i] for i in top)
                        + ". Las columnas de muros nunca cambian porque el agente nunca puede estar ahí.")
     with tab_fwd:
         free = [(r, c) for r in range(SIZE) for c in range(SIZE) if (r, c) not in WALLS]
         cell = st.selectbox("Casilla", free, format_func=lambda p: f"{p}", index=0)
-        fd = forward_details(selected, to_id(cell))
+        fd = forward_details(selected, encode_state(cell, view_phase))
         active = int((fd["hidden"] > 0).sum())
-        st.markdown(f"1. **Entrada one-hot**: solo la casilla {cell} vale 1, así que la red toma la columna "
-                    f"{to_id(cell)} de W1 (+ sesgo).\n"
+        input_note = (f"solo la casilla {cell} vale 1, así que la red toma la columna {to_id(cell)} de W1 (+ sesgo)"
+                      if ghost.is_static else
+                      f"valen 1 la casilla {cell} y la fase f{view_phase} del fantasma (elegida arriba), así que la "
+                      f"red suma las columnas {to_id(cell)} y {N_CELLS + view_phase} de W1 (+ sesgo)")
+        st.markdown(f"1. **Entrada one-hot**: {input_note}.\n"
                     f"2. **ReLU**: {active} de 32 neuronas quedan activas (>0); las demás se apagan y no influyen.\n"
                     f"3. **Salida**: Q(s,a) = Σ W2[a,j]·h[j] + b2[a]. Abajo, el aporte de cada neurona a cada acción.")
         f1, f2 = st.columns([1, 2])
@@ -420,7 +505,7 @@ else:
 with st.expander("Inspeccionar las cuatro acciones de una casilla"):
     row = st.select_slider("Fila", options=list(range(5)), value=0)
     col = st.select_slider("Columna", options=list(range(5)), value=0)
-    values = snapshot_values(selected, to_id((row, col)))
+    values = snapshot_values(selected, encode_state((row, col), view_phase))
     st.dataframe(pd.DataFrame({"acción": ARROWS, "Q(s, acción)": values}),
                  hide_index=True, width="stretch")
 
@@ -428,7 +513,7 @@ st.divider()
 st.subheader("4. Ver cómo juega: sin entrenar vs. entrenado")
 agent = st.radio("Política de la partida", ["Aleatorio", "Sin entrenar", "Checkpoint elegido", "Entrenado actual"],
                  horizontal=True)
-play_key = (mode, agent, selected_ep if agent == "Checkpoint elegido" else None)
+play_key = (mode, agent, selected_ep if agent == "Checkpoint elegido" else None, ghost)
 if st.session_state.get("play_key") != play_key:
     st.session_state.play_key = play_key
     st.session_state.play = make_play()
@@ -438,10 +523,11 @@ def play_one():
     p = st.session_state.play
     if p["done"]:
         return
-    env = Maze(rewards=trainer.rewards)
+    env = Maze(rewards=trainer.rewards, ghost=ghost)
     env.pos = p["pos"]
+    env.phase = p["phase"]
     env.steps = p["steps"]
-    state = to_id(env.pos)
+    state = env.state()
     if agent == "Aleatorio":
         action = st.session_state.play_rng.randrange(4)
         p["last_values"] = None
@@ -451,6 +537,7 @@ def play_one():
         action = int(np.argmax(p["last_values"]))
     _, reward, done, info = env.step(action)
     p["pos"] = env.pos
+    p["phase"] = env.phase
     p["steps"] = env.steps
     p["reward"] += reward
     p["path"].append(env.pos)
@@ -462,6 +549,11 @@ def play_one():
         p["status"] = "👻 Chocó con el fantasma"
     elif done:
         p["status"] = "⌛ Se quedó sin pasos"
+
+def play_board():
+    p = st.session_state.play
+    return render_board(position=p["pos"], path=p["path"], ghost=ghost.position(p["phase"]), route=ghost.route)
+
 
 boardcol, controlscol = st.columns([1, 2])
 with boardcol:
@@ -481,9 +573,7 @@ with controlscol:
     if auto:
         while not st.session_state.play["done"]:
             play_one()
-            board.markdown(render_board(position=st.session_state.play["pos"],
-                                       path=st.session_state.play["path"]),
-                           unsafe_allow_html=True)
+            board.markdown(play_board(), unsafe_allow_html=True)
             time.sleep(0.11)
     p = st.session_state.play
     st.metric("Recompensa de esta partida", f"{p['reward']:.2f}")
@@ -492,9 +582,11 @@ with controlscol:
         q_bars(p["last_values"], chosen=ARROWS.index(p["last_action"]))
         st.caption("Por qué eligió ese movimiento: valores Q de la casilla desde la que salió. "
                    "Sin exploración, siempre toma la barra más larga.")
-    st.caption("El juego es completamente determinista. Compará la misma posición inicial con diferentes checkpoints. Las recompensas mostradas son las del entrenamiento activo.")
-board.markdown(render_board(position=st.session_state.play["pos"],
-                           path=st.session_state.play["path"]), unsafe_allow_html=True)
+    st.caption("El juego es completamente determinista"
+               + ("" if ghost.is_static else " (el fantasma arranca siempre en la fase f0 y repite su ruta)")
+               + ". Compará la misma posición inicial con diferentes checkpoints. "
+               "Las recompensas mostradas son las del entrenamiento activo.")
+board.markdown(play_board(), unsafe_allow_html=True)
 
 with st.expander("Qué está aprendiendo y qué cambiar después"):
     st.markdown("""
@@ -505,6 +597,7 @@ with st.expander("Qué está aprendiendo y qué cambiar después"):
 - La recompensa no es el peso: es una señal escalar que guía la actualización de la política.
 - Probá primero 0, 100, 300 y 800 episodios. Reiniciá y cambiá gamma para observar cómo cambia el aprendizaje.
 - Esta demo entrena con posiciones iniciales aleatorias y evita usar el resultado final como señal de entrenamiento.
+- **Fantasma en movimiento**: elegí un patrón en la barra lateral. El fantasma repite siempre la misma ruta, y el agente ve en qué fase está; por eso puede aprender a *esperar* o *rodearlo*. Compará cuántos episodios necesita frente al fantasma estático: hay más estados (25 × largo del ciclo) que explorar.
 - Para aproximarse a un sistema industrial, el siguiente escalón sería añadir estados que cambian en el tiempo, presupuesto de llamadas y recompensas diferidas.
 """)
 
