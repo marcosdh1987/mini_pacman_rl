@@ -4,14 +4,32 @@ Proyecto didáctico en Python/Streamlit para comparar **Q-learning tabular** y *
 
 ## Ejecución
 
-Con [uv](https://docs.astral.sh/uv/) (recomendado):
+### Con Makefile (recomendado)
+
+Requiere [uv](https://docs.astral.sh/uv/) instalado (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
+```bash
+make run     # crea/actualiza .venv con Python 3.12, instala deps y levanta Streamlit
+```
+
+Otros targets disponibles:
+
+```bash
+make setup   # solo crea el entorno e instala dependencias, sin levantar la app
+make test    # smoke test: entrena unos pocos episodios de Q-learning y DQN sin UI
+make clean   # borra .venv y cachés de Python
+```
+
+La app queda disponible en `http://localhost:8501`.
+
+### Manual con uv
 
 ```bash
 uv sync                    # crea .venv con Python 3.12 e instala dependencias
 uv run streamlit run app.py
 ```
 
-Alternativa con pip:
+### Alternativa con pip
 
 ```bash
 python -m venv .venv
@@ -21,6 +39,11 @@ streamlit run app.py
 ```
 
 En Windows, para activar el entorno virtual: `.venv\Scripts\activate`.
+
+> Nota: `pyproject.toml`/`uv.lock` fijan `torch` a la build CPU-only (este demo
+> entrena una red chica de 2 capas, no hace falta GPU). Si instalás con `pip`
+> en Linux y querés evitar las dependencias CUDA de PyTorch, instalá antes el
+> wheel CPU-only siguiendo https://pytorch.org/get-started/locally/.
 
 ## Experimento sugerido
 

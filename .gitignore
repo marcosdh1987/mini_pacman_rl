@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Streamlit
+.streamlit/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# uv cache (keep uv.lock, ignore local cache dirs if ever created)
+.uv-cache/

@@ -9,3 +9,13 @@ dependencies = [
     "streamlit>=1.50,<2",
     "torch>=2.3,<3",
 ]
+
+# This demo trains a tiny 2-layer net on a 5x5 grid: no GPU is needed, so we
+# pin torch to the CPU-only wheel index to avoid pulling multi-GB CUDA deps.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
