@@ -72,6 +72,20 @@ En Windows, para activar el entorno virtual: `.venv\Scripts\activate`.
 - **DQN**: `W1 (32 × 25)` y `W2 (4 × 32)` son matrices de pesos del modelo. Compará checkpoints para ver cómo cambian.
 - **Evaluación**: una política congelada se prueba desde todas las posiciones iniciales válidas. No hay aleatoriedad del entorno en esas pruebas; es una prueba didáctica, no un benchmark real.
 
+## Entender cómo aprende (y cómo se ajustan los pesos)
+
+- **🔬 Aprender paso a paso**: juega un único movimiento de entrenamiento (con exploración ε) y muestra la cuenta completa:
+  - *Q-learning*: objetivo `r + γ·max Q(s')`, error TD y el nuevo `Q(s,a)` con los números reales; solo cambia una celda de la tabla.
+  - *DQN*: experiencia guardada en memoria, objetivo de la red objetivo, pérdida Huber del lote de 64, normas de gradiente y mapas **ΔW1 / ΔW2** de ese paso de gradiente.
+  - Barras con los 4 valores Q de la casilla antes y después de la actualización.
+- **Curvas de aprendizaje extra**: error de predicción (|error TD| medio o pérdida DQN), cuánto se movieron los parámetros en cada episodio (‖Δθ‖) y ε.
+- **Mapa de valor V(s) = max Q(s,a)**: al mover el slider de checkpoints se ve cómo el valor de la moneda se propaga hacia atrás.
+- **Mapa de visitas**: dónde estuvo el agente durante el entrenamiento (donde casi no pasó, lo aprendido es poco fiable).
+- **Qué cambió desde el checkpoint anterior**: ΔQ o ΔW1/ΔW2 entre dos checkpoints consecutivos.
+- **Cómo decide la red en una casilla** (DQN): activaciones ReLU de las 32 neuronas y el aporte `W2[a,j]·h[j]` de cada neurona a cada acción.
+- **Durante la partida**: barras con los valores Q que explican cada movimiento.
+- Todos los mapas de calor usan una escala divergente centrada en 0 (blanco = 0, azul = positivo, rojo = negativo).
+
 ## Notas metodológicas
 
 - Este juego está inspirado en Pac-Man, **no es el entorno original**.

@@ -93,12 +93,28 @@ def onehot(ids):
 
 def snapshot(trainer):
     if trainer.mode == "Q-learning":
-        return {"episode": trainer.episode, "q": trainer.q.copy()}
+        return {"episode": trainer.episode, "q": trainer.q.copy(),
+                "visits": trainer.visits.copy()}
     return {"episode": trainer.episode,
             "w1": trainer.network.fc1.weight.detach().numpy().copy(),
             "b1": trainer.network.fc1.bias.detach().numpy().copy(),
             "w2": trainer.network.fc2.weight.detach().numpy().copy(),
-            "b2": trainer.network.fc2.bias.detach().numpy().copy()}
+            "b2": trainer.network.fc2.bias.detach().numpy().copy(),
+            "visits": trainer.visits.copy()}
+
+
+def forward_details(snap, state):
+    """Forward pass of the DQN broken into pieces, for explanation.
+
+    Returns the hidden pre-activations, the ReLU activations and the
+    contribution matrix ``contrib[a, j] = W2[a, j] * h[j]`` so that
+    ``Q(s, a) = sum_j contrib[a, j] + b2[a]``.
+    """
+    pre = snap["w1"][:, state] + snap["b1"]  # one-hot input selects a column of W1
+    hidden = np.maximum(0, pre)
+    contrib = snap["w2"] * hidden[None, :]
+    return {"pre": pre, "hidden": hidden, "contrib": contrib,
+            "q": contrib.sum(axis=1) + snap["b2"]}
 
 
 def snapshot_values(snap, state):
@@ -137,23 +153,43 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=0.002)
         self.memory = deque(maxlen=5000)
         self.steps = 0
+        self.visits = np.zeros(SIZE * SIZE, dtype=np.int64)
         self.history = []
+        self.checkpoint_every = 25
+        self.live = None  # episode in progress (used by step-by-step mode)
         self.checkpoints = [snapshot(self)]
 
     def epsilon(self):
         return 0.04 + 0.91 * math.exp(-self.episode / 350)
 
-    def act(self, state, eps):
-        if self.rng.random() < eps:
-            return self.rng.randrange(4)
+    def greedy_values(self, state):
         if self.mode == "Q-learning":
-            return int(np.argmax(self.q[state]))
+            return self.q[state].copy()
         with torch.no_grad():
-            return int(self.network(onehot([state])).argmax(dim=1).item())
+            return self.network(onehot([state]))[0].numpy().copy()
 
-    def replay_update(self, gamma):
+    def act(self, state, eps):
+        return self.act_explained(state, eps)[0]
+
+    def act_explained(self, state, eps):
+        """Return (action, explored): explored=True if the move was random."""
+        if self.rng.random() < eps:
+            return self.rng.randrange(4), True
+        return int(np.argmax(self.greedy_values(state))), False
+
+    def parameter_vector(self):
+        if self.mode == "Q-learning":
+            return self.q.reshape(-1).copy()
+        return torch.cat([p.detach().reshape(-1) for p in self.network.parameters()]).numpy().copy()
+
+    def replay_update(self, gamma, detail=False):
+        """One gradient step on a random minibatch of 64 stored transitions.
+
+        Returns ``None`` while the memory is too small, otherwise a dict with
+        the loss (and, if ``detail``, gradient norms and weight deltas).
+        """
         if len(self.memory) < 64:
-            return
+            return None
         batch = self.rng.sample(self.memory, 64)
         states, actions, rewards, next_states, dones = zip(*batch)
         values = self.network(onehot(states)).gather(
@@ -165,37 +201,107 @@ class Trainer:
         loss = nn.functional.smooth_l1_loss(values, expected)
         self.optimizer.zero_grad()
         loss.backward()
+        info = {"loss": float(loss.item())}
+        if detail:
+            info["grad_w1"] = float(self.network.fc1.weight.grad.norm().item())
+            info["grad_w2"] = float(self.network.fc2.weight.grad.norm().item())
+            before_w1 = self.network.fc1.weight.detach().numpy().copy()
+            before_w2 = self.network.fc2.weight.detach().numpy().copy()
+            info["batch_states"] = sorted(set(int(s) for s in states))
         nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=5.0)
         self.optimizer.step()
         self.steps += 1
-        if self.steps % 125 == 0:
+        info["target_sync"] = self.steps % 125 == 0
+        if info["target_sync"]:
             self.target.load_state_dict(self.network.state_dict())
+        if detail:
+            info["delta_w1"] = self.network.fc1.weight.detach().numpy() - before_w1
+            info["delta_w2"] = self.network.fc2.weight.detach().numpy() - before_w2
+        return info
+
+    # --- episode bookkeeping, shared by batch training and step-by-step mode ---
+    def _begin_episode(self):
+        s = self.environment.reset(random_start=True)
+        self.live = {"state": s, "start": s, "total": 0.0, "t": 0, "eps": self.epsilon(),
+                     "errors": [], "path": [s], "params_before": self.parameter_vector()}
+
+    def _end_episode(self, success):
+        live = self.live
+        self.episode += 1
+        errors = live["errors"]
+        self.history.append({
+            "episode": self.episode, "reward": live["total"], "success": int(success),
+            "epsilon": live["eps"], "steps": live["t"],
+            # Q-learning: mean |TD error|; DQN: mean minibatch loss (NaN before replay starts).
+            "error": float(np.mean(errors)) if errors else float("nan"),
+            # How far the learnable numbers moved during this episode (L2 norm).
+            "weight_change": float(np.linalg.norm(self.parameter_vector() - live["params_before"])),
+        })
+        self.live = None
+        if self.episode % self.checkpoint_every == 0:
+            self.checkpoints.append(snapshot(self))
+
+    def learn_step(self, alpha=0.2, gamma=0.95, detail=False):
+        """Play one move of the current training episode and learn from it.
+
+        Returns a trace dict that explains the update (used by the UI).
+        """
+        if self.live is None:
+            self._begin_episode()
+        live = self.live
+        s = live["state"]
+        values_before = self.greedy_values(s) if detail else None
+        a, explored = self.act_explained(s, live["eps"])
+        sp, reward, done, info = self.environment.step(a)
+        self.visits[s] += 1
+        trace = {"state": s, "action": a, "explored": explored, "eps": live["eps"],
+                 "reward": reward, "next_state": sp, "done": done, "info": info,
+                 "values_before": values_before, "mode": self.mode}
+        if self.mode == "Q-learning":
+            old = float(self.q[s, a])
+            next_max = 0.0 if done else float(np.max(self.q[sp]))
+            target = reward + gamma * next_max
+            td = target - old
+            self.q[s, a] += alpha * td
+            live["errors"].append(abs(td))
+            trace.update(old=old, next_max=next_max, target=target, td=td,
+                         new=float(self.q[s, a]), alpha=alpha, gamma=gamma)
+        else:
+            if detail:
+                with torch.no_grad():
+                    next_max = 0.0 if done else float(self.target(onehot([sp])).max().item())
+                trace.update(old=float(values_before[a]), next_max=next_max,
+                             target=reward + gamma * next_max, gamma=gamma)
+            self.memory.append((s, a, reward, sp, float(done)))
+            upd = self.replay_update(gamma, detail=detail)
+            if upd is not None:
+                live["errors"].append(upd["loss"])
+            trace.update(update=upd, memory=len(self.memory))
+            if detail:
+                trace["new"] = float(self.greedy_values(s)[a])
+        if detail:
+            trace["values_after"] = self.greedy_values(s)
+        live["total"] += reward
+        live["t"] += 1
+        live["state"] = sp
+        live["path"].append(sp)
+        trace["episode_total"] = live["total"]
+        trace["episode_step"] = live["t"]
+        trace["path"] = list(live["path"])
+        if done:
+            self._end_episode(info["success"])
+            trace["episode_finished"] = True
+        return trace
 
     def train(self, episodes=100, alpha=0.2, gamma=0.95, checkpoint_every=25):
+        """Train ``episodes`` full episodes (an unfinished step-by-step episode
+        is completed first and counts as one of them)."""
+        self.checkpoint_every = checkpoint_every
         for _ in range(episodes):
-            s = self.environment.reset(random_start=True)
-            total = 0.0
-            success = False
-            eps = self.epsilon()
-            for t in range(HORIZON):
-                a = self.act(s, eps)
-                sp, reward, done, info = self.environment.step(a)
-                if self.mode == "Q-learning":
-                    target = reward + (0.0 if done else gamma * float(np.max(self.q[sp])))
-                    self.q[s, a] += alpha * (target - self.q[s, a])
-                else:
-                    self.memory.append((s, a, reward, sp, float(done)))
-                    self.replay_update(gamma)
-                total += reward
-                s = sp
-                if done:
-                    success = info["success"]
+            while True:
+                trace = self.learn_step(alpha, gamma)
+                if trace["done"]:
                     break
-            self.episode += 1
-            self.history.append({"episode": self.episode, "reward": total,
-                                 "success": int(success), "epsilon": eps, "steps": t + 1})
-            if self.episode % checkpoint_every == 0:
-                self.checkpoints.append(snapshot(self))
         if self.checkpoints[-1]["episode"] != self.episode:
             self.checkpoints.append(snapshot(self))
 
